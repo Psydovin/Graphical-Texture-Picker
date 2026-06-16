@@ -1732,6 +1732,18 @@ async function selectGame(gameKey) {{
 function closeSettingsModal() {{
   document.getElementById('settingsModal').style.display = 'none';
 }}
+async function browseModsDir() {{
+  const path = await pywebview.api.browse_folder();
+  if (path) document.getElementById('cfgModsDir').value = path;
+}}
+async function browseBaseGame() {{
+  const path = await pywebview.api.browse_o2r_file();
+  if (path) document.getElementById('cfgBaseGame').value = path;
+}}
+async function browseMasterDir() {{
+  const path = await pywebview.api.browse_folder();
+  if (path) document.getElementById('cfgMasterDir').value = path;
+}}
 async function saveSettings() {{
   const btn    = document.getElementById('settingsSaveBtn');
   const status = document.getElementById('settingsStatus');
@@ -1859,24 +1871,36 @@ function _pollPack() {{
     <div style="padding:18px 16px;display:flex;flex-direction:column;gap:14px">
       <label style="display:flex;flex-direction:column;gap:5px">
         <span style="color:#888;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em">Mods Directory <span style="font-weight:400;text-transform:none">(Folder where the mods you wish to merge live.)</span></span>
-        <input id="cfgModsDir" type="text"
-               style="background:#060610;color:#ddd;border:1px solid #2a2a4a;border-radius:4px;
-                      padding:6px 10px;font-size:12px;font-family:monospace;outline:none;width:100%"
-               placeholder="Folder containing .otr / .o2r packs">
+        <div style="display:flex;gap:6px">
+          <input id="cfgModsDir" type="text"
+                 style="background:#060610;color:#ddd;border:1px solid #2a2a4a;border-radius:4px;
+                        padding:6px 10px;font-size:12px;font-family:monospace;outline:none;width:100%"
+                 placeholder="Folder containing .otr / .o2r packs">
+          <button onclick="browseModsDir()" style="padding:6px 14px;background:#111;border:1px solid #333;
+                  color:#7ec8e3;border-radius:4px;cursor:pointer;font-size:12px;white-space:nowrap">Browse…</button>
+        </div>
       </label>
       <label style="display:flex;flex-direction:column;gap:5px">
         <span style="color:#888;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em">Base Game File (oot.o2r)</span>
-        <input id="cfgBaseGame" type="text"
-               style="background:#060610;color:#ddd;border:1px solid #2a2a4a;border-radius:4px;
-                      padding:6px 10px;font-size:12px;font-family:monospace;outline:none;width:100%"
-               placeholder="Path to oot.o2r  (leave blank to skip)">
+        <div style="display:flex;gap:6px">
+          <input id="cfgBaseGame" type="text"
+                 style="background:#060610;color:#ddd;border:1px solid #2a2a4a;border-radius:4px;
+                        padding:6px 10px;font-size:12px;font-family:monospace;outline:none;width:100%"
+                 placeholder="Path to oot.o2r  (leave blank to skip)">
+          <button onclick="browseBaseGame()" style="padding:6px 14px;background:#111;border:1px solid #333;
+                  color:#7ec8e3;border-radius:4px;cursor:pointer;font-size:12px;white-space:nowrap">Browse…</button>
+        </div>
       </label>
       <label style="display:flex;flex-direction:column;gap:5px">
         <span style="color:#888;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em">Output Destination <span style="font-weight:400;text-transform:none">(Ship of Harkinian mods folder)</span></span>
-        <input id="cfgMasterDir" type="text"
-               style="background:#060610;color:#ddd;border:1px solid #2a2a4a;border-radius:4px;
-                      padding:6px 10px;font-size:12px;font-family:monospace;outline:none;width:100%"
-               placeholder="Folder to write 999_Master.o2r into">
+        <div style="display:flex;gap:6px">
+          <input id="cfgMasterDir" type="text"
+                 style="background:#060610;color:#ddd;border:1px solid #2a2a4a;border-radius:4px;
+                        padding:6px 10px;font-size:12px;font-family:monospace;outline:none;width:100%"
+                 placeholder="Folder to write 999_Master.o2r into">
+          <button onclick="browseMasterDir()" style="padding:6px 14px;background:#111;border:1px solid #333;
+                  color:#7ec8e3;border-radius:4px;cursor:pointer;font-size:12px;white-space:nowrap">Browse…</button>
+        </div>
       </label>
     </div>
     <div style="padding:10px 16px;border-top:1px solid #2a2a4a;display:flex;gap:12px;align-items:center">
@@ -1932,6 +1956,17 @@ function _pollPack() {{
             'done':    _rescan_state['done'],
             'error':   _rescan_state['error'],
         }
+
+    def browse_folder(self):
+        result = self._window.create_file_dialog(webview.FileDialog.FOLDER)
+        return result[0] if result else ''
+
+    def browse_o2r_file(self):
+        result = self._window.create_file_dialog(
+            webview.FileDialog.OPEN,
+            file_types=('OoT base game archive (*.o2r)', 'All files (*.*)'),
+        )
+        return result[0] if result else ''
 
     def get_settings(self):
         games_out = {}
