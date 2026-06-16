@@ -25,7 +25,7 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, 'w', encoding='utf-8')
 for _stream in (sys.stdout, sys.stderr):
     try:
-        _stream.reconfigure(encoding='utf-8')
+        _stream.reconfigure(encoding='utf-8', line_buffering=True)
     except Exception:
         pass
 
@@ -770,7 +770,21 @@ class Api:
         # via evaluate_js() right after this method returns. Swapping the
         # document synchronously here means that delivery lands on the new,
         # unrelated document and throws (window.pywebview._returnValuesCallbacks
-        # lookup fails) — defer the swap so that delivery finishes first.
+        # lookup fails) — defer the swap so that delivery finishes first. The
+        # resulting exception is harmless either way (filtered out by our
+        # threading.excepthook below) but deferring avoids it being raised at all.
+        #
+        # Before the very first load_html() ever happens, also make sure the
+        # GUI message loop has actually finished initializing (window.events
+        # .loaded fires once the initial _LOADING_HTML has rendered) — without
+        # this, a fast path (e.g. zero archives configured, so _do_scan
+        # returns near-instantly) can call load_html() before the native
+        # window is ready to receive a cross-thread call, silently dropping
+        # it and leaving the loading screen stuck forever. Slower paths never
+        # hit this race only by accident (the scan itself takes long enough
+        # for the window to become ready), so wait explicitly instead of
+        # relying on that.
+        self._window.events.loaded.wait(timeout=10)
         threading.Timer(0.05, self._window.load_html, args=(html_out,)).start()
         return {'ok': True}
 
