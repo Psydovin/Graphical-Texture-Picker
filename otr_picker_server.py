@@ -793,8 +793,6 @@ class Api:
             selected = obj or ''
             ptype    = ptype or 'objects'
             q        = (q or '').strip().lower()
-            if not self._master_file:
-                return '<h2>999_Master.o2r not found</h2><p>Build it first via the Pack Master button.</p>'
 
             PER_PAGE = 50
             try:
@@ -1121,6 +1119,25 @@ class Api:
                 grid = '<p style="color:#888;padding:20px">← Select an object to compare textures.</p>'
 
             master_size = f'{self._master_file.stat().st_size / 1024 / 1024:.0f} MB' if self._master_file and self._master_file.exists() else '?'
+            needs_setup = MODS_DIR is None
+            if needs_setup:
+                setup_banner = (
+                    '<div style="margin-bottom:12px;padding:12px 16px;background:#1a1400;'
+                    'border:1px solid #e9a020;border-radius:6px;color:#e9a020;font-size:13px">'
+                    '<b>Welcome!</b> No mods folder is set up yet. '
+                    '<button onclick="openSettingsModal()" style="margin-left:6px;padding:4px 12px;'
+                    'background:#e9a020;color:#000;border:none;border-radius:4px;cursor:pointer;'
+                    'font-size:12px;font-weight:700">Open Settings</button></div>'
+                )
+            elif not self._master_file:
+                setup_banner = (
+                    '<div style="margin-bottom:12px;padding:10px 16px;background:#0d0d1a;'
+                    'border:1px solid #2a2a4a;border-radius:6px;color:#888;font-size:12px">'
+                    'No master archive built yet — make your selections, then use the '
+                    '<b style="color:#4caf50">Pack Master</b> button to build one.</div>'
+                )
+            else:
+                setup_banner = ''
             _ag = GAME_DEFS.get(active_game, {})
             _ag_img     = _ag.get('image', '')
             _ag_img_uri = _icon_data_uri(_ag_img)
@@ -1217,6 +1234,7 @@ td {{ border:1px solid #2a2a4a; }}
     {sidebar}
   </div>
   <div class="content">
+    {setup_banner}
     {grid}
   </div>
 </div>
@@ -1366,6 +1384,8 @@ let sels = {{}};
 let pendingGeoBuild = null;  // {{stem, totalChanges}} while previewing a geo build
 
 const OBJ_KEY = {json.dumps(_obj_key if selected else '')};
+const NEEDS_SETUP = {json.dumps(needs_setup)};
+if (NEEDS_SETUP) openSettingsModal();
 
 // Winner graying: grey out every cell that won't be in the master
 // given current committed choices + pending selections.
