@@ -1,28 +1,60 @@
 #!/usr/bin/env python3
 """
-otr_picker_server.py — Master archive browser for OTR/O2R packs.
-
-Routes:
-  /master-browse   — Browse 999_Master.o2r with per-path pack comparison + selection
-  /pack-img        — PNG: image from a specific source archive
-  /submit-browse-choices — POST: save selected choices to choices.json
+otr_picker_server.py — Graphical Texture Picker: native desktop browser/picker
+for OTR/O2R texture packs. Renders entirely inside a pywebview window via
+window.load_html() — there is no local network server and no port.
 
 Usage:  python otr_picker_server.py
-        Then open http://localhost:8765
 
-Requirements:  pip install mpyq Pillow
+Requirements:  pip install mpyq Pillow filelock pywebview
 """
 
-import http.server, socketserver, json, struct, io, threading, webbrowser, sys
-from socketserver import ThreadingMixIn
+import json, struct, io, threading, sys, os, base64, re, html
+from functools import lru_cache
 import mpyq, zipfile
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, unquote, quote
 from PIL import Image
 from filelock import FileLock
 
+# A --noconsole packaged build has no real stdout/stderr (they're None), and
+# this codebase prints unicode status chars like ✓ — guard both cases so
+# print() never crashes the app.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, 'w', encoding='utf-8')
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, 'w', encoding='utf-8')
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
+try:
+    import webview
+except ImportError:
+    print("ERROR: pywebview is required. Install it with: pip install pywebview")
+    sys.exit(1)
+
+# Suppress a known-harmless pywebview exception: each js_api call (e.g. a
+# lazy image fetch kicked off while scrolling) runs in its own throwaway
+# thread, and tries to deliver its return value back to the document that
+# called it. If the user has already navigated elsewhere (load_html() swaps
+# the whole document) before that call resolves, the destination document
+# no longer has the matching callback registered, and pywebview's delivery
+# step throws a JavascriptException in that one disposable thread. It never
+# breaks the app or the currently-displayed page — it's just abandoned work
+# reporting back too late — but left unfiltered it floods the console.
+_default_threading_excepthook = threading.excepthook
+
+def _filtered_threading_excepthook(args):
+    msg = str(args.exc_value)
+    if '_returnValuesCallbacks' in msg and 'is not a function' in msg:
+        return
+    _default_threading_excepthook(args)
+
+threading.excepthook = _filtered_threading_excepthook
+
 # ── config ─────────────────────────────────────────────────────────────────────
-PORT              = 8765
 SCRIPT_DIR        = Path(__file__).parent
 CHOICES_FILE      = SCRIPT_DIR / "choices.json"
 CHOICES_LOCK_FILE = SCRIPT_DIR / "choices.json.lock"
@@ -81,7 +113,7 @@ MODS_DIR, BASE_GAME_FILE, MASTER_DIR, active_game, _games_config = _load_path_co
 _pack_state = {'running': False, 'lines': [], 'done': False, 'error': None}
 _pack_lock  = threading.Lock()
 
-def _pack_worker():
+def _pack_worker(api):
     import shutil, traceback, otr_pack_master as _pm
     lines = _pack_state['lines']
     def _log(msg=''):
@@ -96,9 +128,15 @@ def _pack_worker():
         shutil.copy2(str(target), str(dest))
         _log('Done! 999_Master.o2r is in your mods folder.')
         _log('Refreshing master index...')
-        Handler.master_file  = dest
-        Handler.master_names = archive_names(dest)
-        _log(f'Master index updated: {len(Handler.master_names):,} entries.')
+        api._master_file  = dest
+        api._master_names = archive_names(dest)
+        # _b64_png is keyed on (archive_path_str, internal_path) — the master
+        # archive's path doesn't change across rebuilds even though its
+        # content does, so any previously-viewed texture would otherwise stay
+        # cached with stale bytes forever. Drop the whole cache; re-decoding
+        # source-pack images again is cheap and only happens once per build.
+        _b64_png.cache_clear()
+        _log(f'Master index updated: {len(api._master_names):,} entries.')
         _pack_state['done'] = True
     except Exception as e:
         _log(f'\nERROR: {e}')
@@ -112,7 +150,7 @@ def _pack_worker():
 _rescan_state = {'running': False, 'done': True, 'error': None}
 _rescan_lock  = threading.Lock()
 
-def _do_scan():
+def _do_scan(api):
     _rescan_state.update({'running': True, 'done': False, 'error': None})
     try:
         all_archives = []
@@ -164,20 +202,20 @@ def _do_scan():
             image_paths_cache[arch] = frozenset(img_paths)
             image_dims_cache[arch]  = img_dims
 
-        Handler.all_archives        = all_archives
-        Handler.archive_names_cache = archive_names_cache
-        Handler.image_paths_cache   = image_paths_cache
-        Handler.image_dims_cache    = image_dims_cache
-        Handler.mods_dir            = MODS_DIR
+        api._all_archives        = all_archives
+        api._archive_names_cache = archive_names_cache
+        api._image_paths_cache   = image_paths_cache
+        api._image_dims_cache    = image_dims_cache
+        api._mods_dir            = MODS_DIR
 
         master_path = (MASTER_DIR / '999_Master.o2r') if MASTER_DIR else None
         if master_path and master_path.exists():
-            Handler.master_file  = master_path
-            Handler.master_names = archive_names(master_path)
-            print(f"Master: {len(Handler.master_names):,} entries")
+            api._master_file  = master_path
+            api._master_names = archive_names(master_path)
+            print(f"Master: {len(api._master_names):,} entries")
         else:
-            Handler.master_file  = None
-            Handler.master_names = frozenset()
+            api._master_file  = None
+            api._master_names = frozenset()
             print(f"WARNING: master not found at {master_path}")
 
         _rescan_state['done'] = True
@@ -636,21 +674,6 @@ def read_from_archive(path, internal_name):
             print(f"  read_from_archive mpq {path.name!r} / {internal_name!r}: {e}")
     return None
 
-# ── startup checks ─────────────────────────────────────────────────────────────
-def find_mods_dir():
-    if MODS_DIR.exists():
-        return MODS_DIR
-    candidates = list(SCRIPT_DIR.glob("*.otr")) + list(SCRIPT_DIR.glob("*.o2r"))
-    if candidates:
-        return SCRIPT_DIR
-    print(f"ERROR: Could not find mods folder at {MODS_DIR}")
-    print("Edit the MODS_DIR variable at the top of this script.")
-    sys.exit(1)
-
-# ── threaded server ────────────────────────────────────────────────────────────
-class ThreadedTCPServer(ThreadingMixIn, socketserver.TCPServer):
-    daemon_threads = True
-
 def _res_winner(path, sorted_archives, image_paths_cache, image_dims_cache):
     """Return stem of the best archive for path: highest pixel-count first, then first-sorted."""
     candidates = []
@@ -665,68 +688,86 @@ def _res_winner(path, sorted_archives, image_paths_cache, image_dims_cache):
         return min((a for a, px in candidates if px == best_px), key=lambda a: a.stem).stem
     return candidates[0][0].stem  # all dims unknown → first-sorted
 
-# ── HTTP handler ───────────────────────────────────────────────────────────────
-class Handler(http.server.BaseHTTPRequestHandler):
-    mods_dir          = None
-    master_file         = None         # Path to 999_Master.o2r (or None if not found)
-    master_names        = frozenset()  # All internal paths in the master archive
-    all_archives        = []           # All archives in MODS_DIR, sorted
-    archive_names_cache = {}           # archive_path → frozenset of internal names
-    image_paths_cache   = {}           # archive_path → frozenset of paths with image data
-    image_dims_cache    = {}           # archive_path → {internal_path: (w, h)}
+# ── image decode cache ─────────────────────────────────────────────────────────
+@lru_cache(maxsize=4000)
+def _b64_png(archive_path_str, internal_path):
+    """Decode one texture to a base64 PNG string. Cached since repeat scroll
+    past the same thumbnail is common and archive reads aren't free."""
+    raw = read_from_archive(Path(archive_path_str), internal_path)
+    png = soh_to_png_bytes(raw) if raw else None
+    return base64.b64encode(png).decode('ascii') if png else None
 
-    def log_message(self, *a): pass  # suppress access log
+@lru_cache(maxsize=None)
+def _icon_data_uri(filename):
+    """Base64-inline a small static icon (e.g. game logos) once at first use."""
+    if not filename:
+        return ''
+    p = SCRIPT_DIR / filename
+    if not p.exists() or p.suffix.lower() != '.png':
+        return ''
+    return 'data:image/png;base64,' + base64.b64encode(p.read_bytes()).decode('ascii')
 
-    def do_GET(self):
-        route = self.path.split('?')[0]
+# ── pywebview bridge ───────────────────────────────────────────────────────────
+class Api:
+    def __init__(self):
+        self._window             = None
+        self._mods_dir             = None
+        self._master_file          = None         # Path to 999_Master.o2r (or None if not found)
+        self._master_names         = frozenset()  # All internal paths in the master archive
+        self._all_archives         = []           # All archives in MODS_DIR, sorted
+        self._archive_names_cache  = {}            # archive_path → frozenset of internal names
+        self._image_paths_cache    = {}            # archive_path → frozenset of paths with image data
+        self._image_dims_cache     = {}            # archive_path → {internal_path: (w, h)}
 
-        if route == '/':
-            # Redirect root to master browser
-            self.send_response(302)
-            self.send_header('Location', '/master-browse')
-            self.end_headers()
-        elif route == '/master-img':
-            # Serve a texture directly from 999_Master.o2r.
-            # ?path=alt/objects/...
-            qs    = parse_qs(urlparse(self.path).query)
-            ipath = unquote(qs.get('path', [''])[0])
-            raw   = read_from_archive(self.master_file, ipath) if self.master_file and ipath else None
-            self._img(soh_to_png_bytes(raw) if raw else None)
+    # ── images (called lazily by the IntersectionObserver bootstrap in JS) ─────
+    def get_master_image(self, path):
+        if not self._master_file or not path:
+            return {'ok': False}
+        data = _b64_png(str(self._master_file), path)
+        return {'ok': True, 'data': data} if data else {'ok': False}
 
-        elif route == '/pack-img':
-            # Serve a texture from a specific archive by exact filename.
-            # ?archive=001_OoT_Reloaded_v11.0.0_HD.o2r&path=alt/objects/...
-            qs       = parse_qs(urlparse(self.path).query)
-            ipath    = unquote(qs.get('path',    [''])[0])
-            arc_name = unquote(qs.get('archive', [''])[0])
-            arch     = next((p for p in self.all_archives if p.name == arc_name), None)
-            # Base game stores paths without 'alt/' — strip it before reading
-            read_path = ipath[4:] if (arch == BASE_GAME_FILE and ipath.startswith('alt/')) else ipath
-            raw      = read_from_archive(arch, read_path) if arch and ipath else None
-            self._img(soh_to_png_bytes(raw) if raw else None)
+    def get_pack_image(self, archive_name, path):
+        arch = next((p for p in self._all_archives if p.name == archive_name), None)
+        if not arch or not path:
+            return {'ok': False}
+        # Base game stores paths without 'alt/' — strip it before reading
+        read_path = path[4:] if (arch == BASE_GAME_FILE and path.startswith('alt/')) else path
+        data = _b64_png(str(arch), read_path)
+        return {'ok': True, 'data': data} if data else {'ok': False}
 
-        elif route == '/master-browse':
+    # ── navigation: render full HTML and swap the document directly ────────────
+    def go_master_browse(self, obj='', ptype='objects', q='', page=1):
+        try:
+            html_out = self.render_master_browse(obj, ptype, q, page)
+        except Exception as e:
+            import traceback
+            html_out = f'<pre>render_master_browse error: {e}\n{traceback.format_exc()}</pre>'
+        # Deferred: js_bridge_call's worker thread still needs to deliver this
+        # call's return value back to the *current* (pre-navigation) document
+        # via evaluate_js() right after this method returns. Swapping the
+        # document synchronously here means that delivery lands on the new,
+        # unrelated document and throws (window.pywebview._returnValuesCallbacks
+        # lookup fails) — defer the swap so that delivery finishes first.
+        threading.Timer(0.05, self._window.load_html, args=(html_out,)).start()
+        return {'ok': True}
+
+    def render_master_browse(self, obj='', ptype='objects', q='', page=1):
             # Browse 999_Master.o2r with side-by-side comparison against source packs.
-            # ?obj=object_cow  — select an object to compare
-            # ?type=objects|scenes  — path category (default: objects)
-            import re as _re2
-            if not self.master_file:
-                self._html('<h2>999_Master.o2r not found</h2><p>Build it first: <code>python otr_pack_master.py</code></p>')
-                return
+            selected = obj or ''
+            ptype    = ptype or 'objects'
+            q        = (q or '').strip().lower()
+            if not self._master_file:
+                return '<h2>999_Master.o2r not found</h2><p>Build it first via the Pack Master button.</p>'
 
-            qs       = parse_qs(urlparse(self.path).query)
-            selected = unquote(qs.get('obj',  [''])[0])
-            ptype    = unquote(qs.get('type', ['objects'])[0])
-            q        = unquote(qs.get('q',    [''])[0]).strip().lower()
             PER_PAGE = 50
             try:
-                page = max(1, int(qs.get('page', ['1'])[0]))
-            except ValueError:
+                page = max(1, int(page))
+            except (TypeError, ValueError):
                 page = 1
 
             # All non-empty categories present in the master
             all_types = sorted(set(
-                p.split('/')[1] for p in self.master_names
+                p.split('/')[1] for p in self._master_names
                 if p.startswith('alt/') and p.count('/') >= 2
             ))
 
@@ -736,26 +777,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # All other categories use the simpler alt/category/item_name/ structure.
             if ptype == 'scenes':
                 objects = sorted(set(
-                    '/'.join(p.split('/')[2:4]) for p in self.master_names
+                    '/'.join(p.split('/')[2:4]) for p in self._master_names
                     if p.startswith(prefix) and p.count('/') >= 4
                 ))
             else:
                 objects = sorted(set(
-                    p.split('/')[2] for p in self.master_names
+                    p.split('/')[2] for p in self._master_names
                     if p.startswith(prefix) and p.count('/') >= 3
                 ))
 
             type_nav = ''.join(
-                f'<a href="/master-browse?type={t}" '
-                f'style="color:{"#e94560" if t == ptype else "#7ec8e3"};font-size:12px;'
+                f'<button class="type-nav-btn" data-type="{html.escape(t)}" '
+                f'style="background:none;border:none;cursor:pointer;font:inherit;'
+                f'color:{"#e94560" if t == ptype else "#7ec8e3"};font-size:12px;'
                 f'text-decoration:none;padding:2px 8px;border-radius:4px;'
-                f'{"background:#1a0010;" if t == ptype else ""}">{t}</a>'
+                f'{"background:#1a0010;" if t == ptype else ""}">{html.escape(t)}</button>'
                 for t in all_types
             )
             sidebar = '\n'.join(
-                f'<div style="padding:3px 6px;cursor:pointer;'
+                f'<div class="obj-link" data-obj="{html.escape(o)}" style="padding:3px 6px;cursor:pointer;'
                 f'{"font-weight:bold;color:#e94560;" if o == selected else ""}"'
-                f' onclick="goObj(\'{quote(o)}\')">{o}</div>'
+                f'>{html.escape(o)}</div>'
                 for o in objects
             )
 
@@ -766,7 +808,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if '08_Art' in n:        return '⚔ Dark Link'
                 if n.startswith('06_'):  return '🎒 06 Items'
                 if n.startswith('07_'):  return '🎒 07 Items'
-                m = _re2.search(r'3DE\s*-\s*(\d+)\s+(.+)', n)
+                m = re.search(r'3DE\s*-\s*(\d+)\s+(.+)', n)
                 if m:
                     num  = m.group(1)
                     name = m.group(2).replace('Objects ', '').replace(' (OPTIONAL)', '').replace('3DS', '').replace('Textures', 'Tex').strip()
@@ -778,20 +820,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             if selected:
                 choices_now_geo = json.loads(CHOICES_FILE.read_text()) if CHOICES_FILE.exists() else {}
-                _stem_to_arch = {a.stem: a for a in self.all_archives}
+                _stem_to_arch = {a.stem: a for a in self._all_archives}
                 _obj_key = f'alt/{ptype}/{selected}/'
 
                 # ── Geometry build selector ────────────────────────────────────
                 _geo_builds, _all_geo_paths, _off_active = compute_geo_builds(
-                    _obj_key, self.all_archives,
-                    self.archive_names_cache, self.image_paths_cache,
+                    _obj_key, self._all_archives,
+                    self._archive_names_cache, self._image_paths_cache,
                     choices_now_geo,
                 )
                 geo_build_html = ''
                 if _geo_builds:
-                    import re as _re_gb
                     def _gb_label(stem):
-                        m = _re_gb.search(r'3DE\s*-\s*(\d+)\s+(.+)', stem)
+                        m = re.search(r'3DE\s*-\s*(\d+)\s+(.+)', stem)
                         if m:
                             num  = m.group(1)
                             name = (m.group(2)
@@ -809,12 +850,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                      'color:#888;')
                         style += ('padding:4px 12px;border-radius:4px;cursor:pointer;'
                                   'font-size:11px;font-family:monospace;' + extra_style)
-                        stem_js  = stem.replace("'", "\\'")   # for JS string in onclick
-                        stem_attr = stem.replace('"', '&quot;') # for HTML attribute
                         applied = '1' if active else '0'
-                        return (f'<button class="geo-btn" data-geo-stem="{stem_attr}" '
-                                f'data-applied="{applied}" style="{style}" '
-                                f'onclick="setGeoBuild(\'{stem_js}\')">'
+                        return (f'<button class="geo-btn" data-geo-stem="{html.escape(stem)}" '
+                                f'data-applied="{applied}" style="{style}">'
                                 f'{label}{"  ✓" if active else ""}</button>')
 
                     btns = [_gb_btn('Base Game', '__off__', _off_active)]
@@ -834,19 +872,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     )
 
                 # Union of master paths + all source pack paths for this object
-                master_obj_paths = frozenset(p for p in self.master_names if f'/{selected}/' in p)
+                master_obj_paths = frozenset(p for p in self._master_names if f'/{selected}/' in p)
                 all_obj_paths = set(master_obj_paths)
-                for arch in self.all_archives:
-                    for n in self.archive_names_cache.get(arch, frozenset()):
+                for arch in self._all_archives:
+                    for n in self._archive_names_cache.get(arch, frozenset()):
                         if f'/{selected}/' in n:
                             all_obj_paths.add(n)
                 obj_paths = sorted(all_obj_paths)
 
                 # Packs that have ANY path containing /{selected}/
                 relevant_packs = [
-                    arch for arch in self.all_archives
+                    arch for arch in self._all_archives
                     if any(f'/{selected}/' in n
-                           for n in self.archive_names_cache.get(arch, frozenset()))
+                           for n in self._archive_names_cache.get(arch, frozenset()))
                 ]
 
                 # Column headers
@@ -859,7 +897,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 )
 
                 # Filter to image-only paths first, then paginate
-                master_img_set = self.image_paths_cache.get(self.master_file, frozenset())
+                master_img_set = self._image_paths_cache.get(self._master_file, frozenset())
                 filtered_paths = []
                 for p in obj_paths:
                     if q and q not in p.lower():
@@ -868,9 +906,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if in_m and p in master_img_set:
                         filtered_paths.append(p)
                         continue
-                    if any(p in self.image_paths_cache.get(arch, frozenset())
+                    if any(p in self._image_paths_cache.get(arch, frozenset())
                            for arch in relevant_packs
-                           if p in self.archive_names_cache.get(arch, frozenset())):
+                           if p in self._archive_names_cache.get(arch, frozenset())):
                         filtered_paths.append(p)
 
                 total_rows  = len(filtered_paths)
@@ -887,7 +925,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     else:
                         committed_winners[_pw] = _res_winner(
                             _pw, _sorted_rel,
-                            self.image_paths_cache, self.image_dims_cache
+                            self._image_paths_cache, self._image_dims_cache
                         )
 
                 rows = []
@@ -895,24 +933,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     fname = p.split('/')[-1]
                     in_master = p in master_obj_paths
                     if in_master:
-                        m_url = f'/master-img?path={quote(p)}'
                         master_td = (
                             f'<td style="background:#0a1a0a;border:2px solid #4caf50;vertical-align:top;padding:4px">'
-                            f'<img src="{m_url}" loading="lazy" style="max-width:180px;max-height:180px;image-rendering:pixelated;display:block" '
-                            f'onerror="this.style.display=\'none\';checkRowImages(this)"></td>'
+                            f'<img data-kind="master" data-path="{html.escape(p)}" '
+                            f'style="max-width:180px;max-height:180px;image-rendering:pixelated;display:block;background:#0d0d1a"></td>'
                         )
                     else:
                         master_td = '<td style="background:#1a1a1a;border:1px solid #333;color:#444;text-align:center;vertical-align:middle;font-size:10px;padding:4px">not in<br>master</td>'
                     pack_tds = []
                     img_count = 1 if in_master else 0
                     for arch in relevant_packs:
-                        if p in self.archive_names_cache.get(arch, frozenset()):
+                        if p in self._archive_names_cache.get(arch, frozenset()):
                             img_count += 1
-                            url = f'/pack-img?archive={quote(arch.name)}&path={quote(p)}'
                             pack_tds.append(
                                 f'<td class="pick-cell" data-path="{p}" data-arch="{arch.stem}" style="vertical-align:top;padding:4px">'
-                                f'<img src="{url}" loading="lazy" style="max-width:180px;max-height:180px;image-rendering:pixelated;display:block" '
-                                f'onerror="this.style.display=\'none\';checkRowImages(this)"></td>'
+                                f'<img data-kind="pack" data-archfile="{html.escape(arch.name)}" data-path="{html.escape(p)}" '
+                                f'style="max-width:180px;max-height:180px;image-rendering:pixelated;display:block;background:#0d0d1a"></td>'
                             )
                         else:
                             pack_tds.append('<td style="color:#333;text-align:center;vertical-align:middle;font-size:20px">—</td>')
@@ -930,16 +966,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         f'</tr>'
                     )
 
-                def page_url(pg):
-                    base = f'/master-browse?type={ptype}&obj={quote(selected)}&page={pg}'
-                    return base + (f'&q={quote(q)}' if q else '')
+                def _page_btn_style():
+                    return ('background:none;border:1px solid #2a2a4a;cursor:pointer;font:inherit;'
+                            'color:#7ec8e3;text-decoration:none;padding:3px 10px;border-radius:4px')
 
-                prev_btn = (f'<a href="{page_url(page-1)}" style="color:#7ec8e3;text-decoration:none;padding:3px 10px;'
-                            f'border:1px solid #2a2a4a;border-radius:4px">&#8592; Prev</a>'
+                prev_btn = (f'<button class="page-btn" data-page="{page-1}" style="{_page_btn_style()}">&#8592; Prev</button>'
                             if page > 1 else
                             '<span style="color:#333;padding:3px 10px;border:1px solid #222;border-radius:4px">&#8592; Prev</span>')
-                next_btn = (f'<a href="{page_url(page+1)}" style="color:#7ec8e3;text-decoration:none;padding:3px 10px;'
-                            f'border:1px solid #2a2a4a;border-radius:4px">Next &#8594;</a>'
+                next_btn = (f'<button class="page-btn" data-page="{page+1}" style="{_page_btn_style()}">Next &#8594;</button>'
                             if page < total_pages else
                             '<span style="color:#333;padding:3px 10px;border:1px solid #222;border-radius:4px">Next &#8594;</span>')
                 pag_row = (f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">'
@@ -948,9 +982,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            f'{total_rows} entries &bull; showing {len(rows)}</span>'
                            f'{next_btn}'
                            + ''.join(
-                               f'<a href="{page_url(pg)}" style="color:{"#e94560" if pg==page else "#7ec8e3"};'
+                               f'<button class="page-btn" data-page="{pg}" style="background:none;border:none;cursor:pointer;font:inherit;'
+                               f'color:{"#e94560" if pg==page else "#7ec8e3"};'
                                f'font-size:11px;text-decoration:none;padding:2px 7px;border-radius:3px;'
-                               f'{"background:#1a0010;" if pg==page else ""}">{pg}</a>'
+                               f'{"background:#1a0010;" if pg==page else ""}">{pg}</button>'
                                for pg in range(max(1, page-4), min(total_pages, page+4)+1)
                            )
                            + '</div>')
@@ -972,9 +1007,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 hits    = _dd(list)   # obj -> [path, ...]
                 obj_cat = {}          # obj -> category (objects / textures / scenes / …)
                 seen = set()
-                all_img_arches = list(self.all_archives) + ([self.master_file] if self.master_file else [])
+                all_img_arches = list(self._all_archives) + ([self._master_file] if self._master_file else [])
                 for arch in all_img_arches:
-                    for p in self.image_paths_cache.get(arch, frozenset()):
+                    for p in self._image_paths_cache.get(arch, frozenset()):
                         if q in p.lower() and p not in seen:
                             seen.add(p)
                             parts = p.split('/')
@@ -990,36 +1025,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     rows_html.append(
                         f'<tr><td colspan="5" style="background:#16213e;color:#7ec8e3;font-weight:bold;'
                         f'padding:5px 8px;font-size:12px">'
-                        f'<a href="/master-browse?type={cat}&obj={quote(obj)}&q={quote(q)}" '
-                        f'style="color:#e94560;text-decoration:none">{obj}</a>'
-                        f'<span style="color:#444;font-size:10px;margin-left:8px">{cat}</span>'
+                        f'<span class="search-obj-link" data-cat="{html.escape(cat)}" data-obj="{html.escape(obj)}" '
+                        f'style="color:#e94560;text-decoration:underline;cursor:pointer">{html.escape(obj)}</span>'
+                        f'<span style="color:#444;font-size:10px;margin-left:8px">{html.escape(cat)}</span>'
                         f'</td></tr>'
                     )
                     for p in sorted(hits[obj]):
                         fname = p.split('/')[-1]
-                        in_m  = p in self.master_names
+                        in_m  = p in self._master_names
                         choice = choices_now.get(p, '')
                         m_cell = ('<span style="color:#4caf50">✓ master</span>' if in_m
                                   else '<span style="color:#444">—</span>')
                         c_cell = (f'<span style="color:#e9a020">{choice}</span>' if choice
                                   else '<span style="color:#444">first-sorted</span>')
                         # Thumbnail: prefer master, else first source archive with this image
-                        if in_m and self.master_file:
-                            thumb_url = f'/master-img?path={quote(p)}'
+                        if in_m and self._master_file:
+                            thumb_html = (
+                                f'<img data-kind="master" data-path="{html.escape(p)}" '
+                                f'style="max-width:80px;max-height:80px;image-rendering:pixelated;'
+                                f'vertical-align:middle;display:block;margin:auto;background:#0d0d1a">'
+                            )
                         else:
                             src_arch = next(
-                                (a for a in self.all_archives
-                                 if p in self.image_paths_cache.get(a, frozenset())),
+                                (a for a in self._all_archives
+                                 if p in self._image_paths_cache.get(a, frozenset())),
                                 None
                             )
-                            thumb_url = (f'/pack-img?archive={quote(src_arch.name)}&path={quote(p)}'
-                                         if src_arch else '')
-                        thumb_html = (
-                            f'<img src="{thumb_url}" loading="lazy" '
-                            f'style="max-width:80px;max-height:80px;image-rendering:pixelated;'
-                            f'vertical-align:middle;display:block;margin:auto">'
-                            if thumb_url else ''
-                        )
+                            thumb_html = (
+                                f'<img data-kind="pack" data-archfile="{html.escape(src_arch.name)}" data-path="{html.escape(p)}" '
+                                f'style="max-width:80px;max-height:80px;image-rendering:pixelated;'
+                                f'vertical-align:middle;display:block;margin:auto;background:#0d0d1a">'
+                                if src_arch else ''
+                            )
                         rows_html.append(
                             f'<tr>'
                             f'<td style="padding:4px 8px;font-family:monospace;font-size:11px;color:#ddd">{fname}</td>'
@@ -1046,11 +1083,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 grid = '<p style="color:#888;padding:20px">← Select an object to compare textures.</p>'
 
-            master_size = f'{self.master_file.stat().st_size / 1024 / 1024:.0f} MB' if self.master_file and self.master_file.exists() else '?'
+            master_size = f'{self._master_file.stat().st_size / 1024 / 1024:.0f} MB' if self._master_file and self._master_file.exists() else '?'
             _ag = GAME_DEFS.get(active_game, {})
-            _ag_img  = _ag.get('image', '')
-            _ag_name = _ag.get('name', 'Settings')
-            html = f'''<!doctype html>
+            _ag_img     = _ag.get('image', '')
+            _ag_img_uri = _icon_data_uri(_ag_img)
+            _ag_name    = _ag.get('name', 'Settings')
+            out_html = f'''<!doctype html>
 <html><head><meta charset="UTF-8"><title>Master Browser</title>
 <style>
 * {{ box-sizing:border-box; margin:0; padding:0; }}
@@ -1103,16 +1141,17 @@ td {{ border:1px solid #2a2a4a; }}
 <div class="topbar">
   <div>
     <h1>Master Archive Browser</h1>
-    <div class="meta">{len(self.master_names):,} entries &bull; {master_size}</div>
+    <div class="meta">{len(self._master_names):,} entries &bull; {master_size}</div>
   </div>
-  <form method="get" action="/master-browse" style="display:flex;gap:6px;align-items:center;flex:1;max-width:400px;margin:0 20px">
-    <input name="q" type="text" value="{q}" placeholder="search all paths…"
+  <div style="display:flex;gap:6px;align-items:center;flex:1;max-width:400px;margin:0 20px">
+    <input id="searchInput" type="text" value="{html.escape(q)}" placeholder="search all paths…"
+           onkeydown="if(event.key==='Enter')doSearch()"
            style="flex:1;background:#0d0d1a;color:#ddd;border:1px solid #2a2a4a;border-radius:4px;
                   padding:5px 10px;font-size:12px;font-family:monospace;outline:none">
-    <button type="submit" style="background:#2a2a4a;color:#7ec8e3;border:none;border-radius:4px;
+    <button onclick="doSearch()" style="background:#2a2a4a;color:#7ec8e3;border:none;border-radius:4px;
             padding:5px 12px;cursor:pointer;font-size:12px">Search</button>
-    {'<a href="/master-browse" style="color:#888;font-size:11px;text-decoration:none;white-space:nowrap">✕ clear</a>' if q else ''}
-  </form>
+    {'<button onclick="clearSearch()" style="background:none;border:none;cursor:pointer;color:#888;font-size:11px;text-decoration:none;white-space:nowrap">✕ clear</button>' if q else ''}
+  </div>
   <div style="display:flex;align-items:center;gap:8px">
     {type_nav}
     <button onclick="openPackModal()"
@@ -1124,7 +1163,7 @@ td {{ border:1px solid #2a2a4a; }}
             style="padding:5px 10px;background:#0d0d1a;border:1px solid #2a2a4a;color:#7ec8e3;
                    border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;white-space:nowrap;
                    display:flex;align-items:center;gap:6px">
-      {'<img src="/game-img/' + _ag_img + '" style="width:20px;height:20px;object-fit:contain">' if _ag_img else '⚙'}
+      {'<img src="' + _ag_img_uri + '" style="width:20px;height:20px;object-fit:contain">' if _ag_img_uri else '⚙'}
       {_ag_name}
     </button>
   </div>
@@ -1177,23 +1216,119 @@ function filterSidebar(val) {{
   }});
 }}
 
-// Sidebar scroll persistence
+// Navigation: every "page change" re-renders server-side and swaps the
+// whole document via window.load_html() — there is no HTTP server/URL bar.
+let SELECTED = {json.dumps(selected)};
+let PTYPE    = {json.dumps(ptype)};
+let SEARCH_Q = {json.dumps(q)};
+let PAGE     = {page};
+
 function goObj(obj) {{
-  var sb = document.querySelector('.sidebar');
-  if (sb) sessionStorage.setItem('sbScroll', sb.scrollTop);
-  location = '/master-browse?type={ptype}&obj=' + encodeURIComponent(obj) + '&page=1';
+  pywebview.api.go_master_browse(obj, PTYPE, '', 1);
 }}
-document.addEventListener('DOMContentLoaded', function() {{
-  var sb = document.querySelector('.sidebar');
-  var saved = sessionStorage.getItem('sbScroll');
-  if (sb && saved) sb.scrollTop = parseInt(saved, 10);
+function goType(t) {{
+  pywebview.api.go_master_browse('', t, '', 1);
+}}
+function goPage(n) {{
+  pywebview.api.go_master_browse(SELECTED, PTYPE, SEARCH_Q, n);
+}}
+function doSearch() {{
+  var val = document.getElementById('searchInput').value;
+  pywebview.api.go_master_browse('', 'objects', val, 1);
+}}
+function clearSearch() {{
+  pywebview.api.go_master_browse('', 'objects', '', 1);
+}}
+function goSearchObj(cat, obj) {{
+  pywebview.api.go_master_browse(obj, cat, SEARCH_Q, 1);
+}}
+function reloadCurrentView() {{
+  pywebview.api.go_master_browse(SELECTED, PTYPE, SEARCH_Q, PAGE);
+}}
+
+document.querySelectorAll('.obj-link').forEach(function(d) {{
+  d.addEventListener('click', function() {{ goObj(this.dataset.obj); }});
 }});
+document.querySelectorAll('.type-nav-btn').forEach(function(b) {{
+  b.addEventListener('click', function() {{ goType(this.dataset.type); }});
+}});
+document.querySelectorAll('.page-btn').forEach(function(b) {{
+  b.addEventListener('click', function() {{ goPage(parseInt(this.dataset.page, 10)); }});
+}});
+document.querySelectorAll('.search-obj-link').forEach(function(s) {{
+  s.addEventListener('click', function() {{ goSearchObj(this.dataset.cat, this.dataset.obj); }});
+}});
+document.querySelectorAll('.geo-btn').forEach(function(b) {{
+  b.addEventListener('click', function() {{ setGeoBuild(this.dataset.geoStem); }});
+}});
+
+// ── Lazy image loading via the pywebview bridge (no HTTP, no native lazy-load) ──
+(function() {{
+  let inFlight = 0;
+  const MAX_INFLIGHT = 5;
+  const queue = [];
+  const timers = new WeakMap();
+
+  function drain() {{
+    if (inFlight >= MAX_INFLIGHT || queue.length === 0) return;
+    const img = queue.shift();
+    if (!img.isConnected) {{ drain(); return; }}
+    inFlight++;
+    let p;
+    const kind = img.dataset.kind;
+    if (kind === 'master') p = pywebview.api.get_master_image(img.dataset.path);
+    else if (kind === 'pack') p = pywebview.api.get_pack_image(img.dataset.archfile, img.dataset.path);
+    else {{ inFlight--; drain(); return; }}
+    p.then(function(result) {{
+      if (img.isConnected) {{
+        if (result && result.ok) {{
+          img.onerror = function() {{ this.style.display = 'none'; checkRowImages(this); }};
+          img.src = 'data:image/png;base64,' + result.data;
+        }} else {{
+          img.style.display = 'none';
+          checkRowImages(img);
+        }}
+      }}
+    }}).catch(function() {{}}).finally(function() {{
+      inFlight--;
+      drain();
+    }});
+  }}
+
+  function schedule(img) {{
+    if (timers.has(img)) return;
+    timers.set(img, setTimeout(function() {{
+      timers.delete(img);
+      queue.push(img);
+      drain();
+    }}, 120));
+  }}
+  function cancel(img) {{
+    const t = timers.get(img);
+    if (t) {{ clearTimeout(t); timers.delete(img); }}
+  }}
+
+  const observer = new IntersectionObserver(function(entries) {{
+    entries.forEach(function(entry) {{
+      if (entry.isIntersecting) schedule(entry.target);
+      else cancel(entry.target);
+    }});
+  }}, {{rootMargin: '200px'}});
+
+  // window.load_html() delivers this document via a fresh navigation; the
+  // pywebview.api bridge may not be re-attached yet at the instant this
+  // script runs (it's not gated on a user click like the nav functions are).
+  function startObserving() {{
+    document.querySelectorAll('img[data-kind]').forEach(function(img) {{ observer.observe(img); }});
+  }}
+  if (window.pywebview && window.pywebview.api) startObserving();
+  else window.addEventListener('pywebviewready', startObserving);
+}})();
 
 let sels = {{}};
 let pendingGeoBuild = null;  // {{stem, totalChanges}} while previewing a geo build
 
 const OBJ_KEY = {json.dumps(_obj_key if selected else '')};
-const PTYPE   = {json.dumps(ptype)};
 
 // Winner graying: grey out every cell that won't be in the master
 // given current committed choices + pending selections.
@@ -1367,12 +1502,7 @@ function clearSels() {{
 updateGraying();
 
 async function submitSels() {{
-  const r = await fetch('/submit-browse-choices', {{
-    method: 'POST',
-    headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify(sels)
-  }});
-  const j = await r.json();
+  const j = await pywebview.api.submit_browse_choices(sels);
   if (j.ok) {{
     alert('Saved ' + j.count + ' choice(s) to choices.json.\\nRebuild the master: python otr_pack_master.py');
     clearSels();
@@ -1386,12 +1516,7 @@ async function setGeoBuild(geoStem) {{
   if (!OBJ_KEY) return;
   let j;
   try {{
-    const r = await fetch('/preview-geo-build', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{obj_key: OBJ_KEY, geo_stem: geoStem}})
-    }});
-    j = await r.json();
+    j = await pywebview.api.preview_geo_build(OBJ_KEY, geoStem);
   }} catch(e) {{ alert('Preview error: ' + e); return; }}
   if (!j.ok) {{ alert('Preview error: ' + (j.error || 'unknown')); return; }}
 
@@ -1447,12 +1572,7 @@ function highlightGeoBtnSelected(selectedStem) {{
 async function applyGeoBuild() {{
   if (!pendingGeoBuild) return;
   try {{
-    const r = await fetch('/set-geo-build', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{obj_key: OBJ_KEY, geo_stem: pendingGeoBuild.stem, ptype: PTYPE}})
-    }});
-    const j = await r.json();
+    const j = await pywebview.api.set_geo_build(OBJ_KEY, pendingGeoBuild.stem, PTYPE);
     if (j.ok) {{
       // Update committed-winner on every visible row so graying recalculates correctly
       const eff = pendingGeoBuild.effective || {{}};
@@ -1478,8 +1598,7 @@ let _settingsGames      = {{}};
 let _settingsActiveGame = '';
 
 async function openSettingsModal() {{
-  const r   = await fetch('/settings');
-  const cfg = await r.json();
+  const cfg = await pywebview.api.get_settings();
   _settingsGames      = cfg.games      || {{}};
   _settingsActiveGame = cfg.active_game || '';
   _buildGameSelector();
@@ -1503,9 +1622,9 @@ function _buildGameSelector() {{
       'border:2px solid ' + (isActive ? '#7ec8e3' : '#2a2a4a'),
       'border-radius:6px;cursor:pointer',
     ].join(';');
-    if (gv.image) {{
+    if (gv.image_data_uri) {{
       const img = document.createElement('img');
-      img.src = '/game-img/' + gv.image;
+      img.src = gv.image_data_uri;
       img.style.cssText = 'width:52px;height:52px;object-fit:contain';
       btn.appendChild(img);
     }}
@@ -1529,12 +1648,7 @@ async function selectGame(gameKey) {{
   btn.disabled = true; btn.style.opacity = '0.45';
   status.style.color = '#888'; status.textContent = 'Switching game...';
   try {{
-    const r = await fetch('/switch-game', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{game: gameKey}})
-    }});
-    const j = await r.json();
+    const j = await pywebview.api.switch_game(gameKey);
     if (!j.ok) {{
       status.textContent = 'Error: ' + j.error;
       status.style.color = '#e94560';
@@ -1567,16 +1681,11 @@ async function saveSettings() {{
   btn.disabled = true; btn.style.opacity = '0.45';
   status.style.color = '#888'; status.textContent = 'Saving...';
   try {{
-    const r = await fetch('/settings', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{
-        mods_dir:       document.getElementById('cfgModsDir').value.trim(),
-        base_game_file: document.getElementById('cfgBaseGame').value.trim(),
-        master_dir:     document.getElementById('cfgMasterDir').value.trim(),
-      }})
-    }});
-    const j = await r.json();
+    const j = await pywebview.api.save_settings(
+      document.getElementById('cfgModsDir').value.trim(),
+      document.getElementById('cfgBaseGame').value.trim(),
+      document.getElementById('cfgMasterDir').value.trim(),
+    );
     if (!j.ok) {{
       status.textContent = 'Error: ' + j.error;
       status.style.color = '#e94560';
@@ -1595,7 +1704,7 @@ async function saveSettings() {{
 function _pollRescan() {{
   setTimeout(async function() {{
     try {{
-      const j = await (await fetch('/rescan-status')).json();
+      const j = await pywebview.api.get_rescan_status();
       if (j.done) {{
         if (j.error) {{
           document.getElementById('settingsStatus').textContent = 'Error: ' + j.error;
@@ -1603,7 +1712,7 @@ function _pollRescan() {{
           document.getElementById('settingsSaveBtn').disabled = false;
           document.getElementById('settingsSaveBtn').style.opacity = '1';
         }} else {{
-          location.reload();
+          reloadCurrentView();
         }}
       }} else {{ _pollRescan(); }}
     }} catch(e) {{ _pollRescan(); }}
@@ -1631,8 +1740,7 @@ async function startPack() {{
   document.getElementById('packLog').textContent = '';
   _packOffset = 0;
   try {{
-    const r = await fetch('/pack-master', {{method: 'POST'}});
-    const j = await r.json();
+    const j = await pywebview.api.start_pack_master();
     if (!j.ok) {{
       status.textContent = 'Error: ' + j.error;
       status.style.color = '#e94560';
@@ -1651,8 +1759,7 @@ async function startPack() {{
 function _pollPack() {{
   _packPollTimer = setTimeout(async function() {{
     try {{
-      const r = await fetch('/pack-master-log?offset=' + _packOffset);
-      const j = await r.json();
+      const j = await pywebview.api.get_pack_master_log(_packOffset);
       if (j.lines && j.lines.length) {{
         const log = document.getElementById('packLog');
         log.textContent += j.lines.join('\\n') + '\\n';
@@ -1669,7 +1776,7 @@ function _pollPack() {{
         }} else {{
           status.textContent = 'Done!';
           status.style.color = '#4caf50';
-          location.reload();
+          reloadCurrentView();
         }}
       }} else {{
         _pollPack();
@@ -1752,243 +1859,62 @@ function _pollPack() {{
   </div>
 </div>
 </body></html>'''
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(html.encode())
+            return out_html
 
-        elif route == '/pack-browse':
-            # List all unique object names in any pack.
-            # Matches by: "3DE - XX" prefix, bare number prefix, or any name substring.
-            # Visit http://localhost:8765/pack-browse?pack=06_Items or ?pack=01
-            qs       = parse_qs(urlparse(self.path).query)
-            query    = unquote(qs.get('pack', [''])[0])
-            padded   = query.zfill(2)
-            archive  = next((p for p in sorted(self.mods_dir.iterdir())
-                             if p.suffix.lower() in ('.otr', '.o2r') and (
-                                 f'3DE - {padded}' in p.name or
-                                 p.name.startswith(query) or
-                                 query in p.name
-                             )), None)
-            if not archive:
-                self._html(f"<h2>Pack {pack_num} not found</h2>")
-                return
-            names = archive_names(archive)
-            # Extract unique object folder names (alt/objects/OBJECT_NAME/...)
-            objects = sorted(set(
-                p.split('/')[2] for p in names
-                if p.startswith('alt/') and p.count('/') >= 3
-            ))
-            rows = ''.join(f'<tr><td><code>{o}</code></td></tr>' for o in objects)
-            html = (f'<h2>{archive.name}</h2>'
-                    f'<p>{len(names)} total files, {len(objects)} unique objects</p>'
-                    f'<table border=1 cellpadding=6><tr><th>Object name</th></tr>{rows}</table>')
-            self._html(html)
-        elif route == '/bg-img':
-            # Serve a texture directly from an archive by pack keyword + internal path.
-            # ?pack=26  → Djipi's 3DE - 26 Background 3DS
-            # ?pack=oot → 001_OoT_Reloaded
-            # ?path=alt/...
-            qs      = parse_qs(urlparse(self.path).query)
-            ipath   = unquote(qs.get('path', [''])[0])
-            pk      = unquote(qs.get('pack', [''])[0])
-            if pk == 'oot':
-                arch = next((p for p in self.mods_dir.iterdir() if p.name.startswith('001_')), None)
-            else:
-                arch = next((p for p in sorted(self.mods_dir.iterdir())
-                             if p.suffix.lower() in ('.otr', '.o2r') and pk in p.name), None)
-            raw = read_from_archive(arch, ipath) if arch and ipath else None
-            self._img(soh_to_png_bytes(raw) if raw else None)
-        elif route == '/bg-browser':
-            # Background scene browser for pack 26/27.
-            # Lists scenes extracted from filenames; click a scene to view thumbnails.
-            # Visit http://localhost:8765/bg-browser
-            import re as _re
-            qs       = parse_qs(urlparse(self.path).query)
-            selected = unquote(qs.get('scene', [''])[0])
-            pack26   = next((p for p in self.mods_dir.iterdir() if '3DE - 26' in p.name), None)
-            ootpack  = next((p for p in self.mods_dir.iterdir() if p.name.startswith('001_')), None)
-            if not pack26:
-                self._html('<h2>Pack 26 not found</h2>')
-                return
-            all_names = sorted(archive_names(pack26))
-            # Extract scene prefix from filename: everything before Tex_ / _room / _scene
-            def scene_of(path):
-                fname = path.split('/')[-1]
-                m = _re.match(r'^([A-Za-z][A-Za-z0-9_]*?)(?:Tex_|_room\d|_scene)', fname)
-                return m.group(1) if m else None
-            scenes = sorted(set(s for p in all_names for s in [scene_of(p)] if s))
-            # Already-excluded scenes
-            excluded_scenes = ['hairal_niwa', 'spot00', 'spot15']
-            # Sidebar scene list
-            sidebar_items = []
-            for s in scenes:
-                is_excl  = any(e in s for e in excluded_scenes)
-                style    = 'color:#c00;' if is_excl else ''
-                selected_style = 'font-weight:bold;background:#ffe;' if s == selected else ''
-                sidebar_items.append(
-                    f'<div style="padding:3px 6px;cursor:pointer;{style}{selected_style}"'
-                    f' onclick="location=\'/bg-browser?scene={s}\'">{s}'
-                    + (' ✗' if is_excl else '') + '</div>'
+    def get_pack_master_log(self, offset=0):
+        offset = int(offset)
+        return {
+            'lines': _pack_state['lines'][offset:],
+            'done':  _pack_state['done'],
+            'error': _pack_state['error'],
+        }
+
+    def get_rescan_status(self):
+        return {
+            'running': _rescan_state['running'],
+            'done':    _rescan_state['done'],
+            'error':   _rescan_state['error'],
+        }
+
+    def get_settings(self):
+        games_out = {}
+        for gk, gdef in GAME_DEFS.items():
+            defs = _GAME_DEFAULTS.get(gk, {})
+            gcfg = _games_config.get(gk, {})
+            if gk == active_game:
+                mods_dir_str, base_game_str, master_dir_str = (
+                    str(MODS_DIR)       if MODS_DIR       else '',
+                    str(BASE_GAME_FILE) if BASE_GAME_FILE else '',
+                    str(MASTER_DIR)     if MASTER_DIR     else '',
                 )
-            sidebar = '\n'.join(sidebar_items)
-            # Thumbnail grid for selected scene
-            if selected:
-                scene_paths = [p for p in all_names if (scene_of(p) or '') == selected]
-                oot_names   = archive_names(ootpack) if ootpack else frozenset()
-                thumbs = []
-                for p in sorted(scene_paths):
-                    fname = p.split('/')[-1]
-                    djipi_url = f'/bg-img?pack=26&path={p}'
-                    # find matching OoT Reloaded path
-                    oot_match = next((n for n in oot_names if fname in n), None)
-                    oot_url   = f'/bg-img?pack=oot&path={oot_match}' if oot_match else ''
-                    oot_cell  = f'<img src="{oot_url}" style="max-width:200px;max-height:200px;image-rendering:pixelated">' if oot_url else '<em style="color:#999">no OoT match</em>'
-                    thumbs.append(
-                        f'<tr><td style="font-size:11px;max-width:220px;word-break:break-all">{fname}</td>'
-                        f'<td><img src="{djipi_url}" style="max-width:200px;max-height:200px;image-rendering:pixelated"></td>'
-                        f'<td>{oot_cell}</td></tr>'
-                    )
-                grid = (f'<h3>{selected} ({len(scene_paths)} textures)</h3>'
-                        f'<table border=1 cellpadding=4><tr><th>File</th><th>Djipi</th><th>OoT Reloaded</th></tr>'
-                        + '\n'.join(thumbs) + '</table>')
             else:
-                grid = '<p style="color:#666">← Click a scene to preview its textures.</p>'
-            html = f'''<!doctype html><html><head><title>BG Browser</title></head><body>
-<h2>Background Scene Browser (Pack 26/27)</h2>
-<p>Red = already excluded (using OoT Reloaded). Click a scene to preview.</p>
-<div style="display:flex;gap:20px;align-items:flex-start">
-  <div style="min-width:200px;max-height:90vh;overflow-y:auto;border:1px solid #ccc;padding:4px;font-family:monospace;font-size:13px">
-    {sidebar}
-  </div>
-  <div style="flex:1;overflow-x:auto">{grid}</div>
-</div>
-</body></html>'''
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(html.encode())
-        elif route == '/debug-tex':
-            # Inspect raw texture header from any archive.
-            # ?archive=oot.o2r&path=textures/vr_ALVR_static/gMarketPotionShopBgTex
-            qs       = parse_qs(urlparse(self.path).query)
-            ipath    = unquote(qs.get('path',    [''])[0])
-            arc_name = unquote(qs.get('archive', [''])[0])
-            arch     = next((p for p in self.all_archives if p.name == arc_name), None)
-            raw      = read_from_archive(arch, ipath) if arch and ipath else None
-            if not raw:
-                self._html(f'<pre>NOT FOUND: archive={arc_name!r} path={ipath!r}</pre>')
-                return
-            import struct as _s
-            lines = [f'archive: {arc_name}', f'path: {ipath}', f'size: {len(raw)} bytes',
-                     f'magic: {raw[:8].hex()}', '']
-            if len(raw) >= 0x60 and raw[4:8] in (b'XETO', b'OTEX'):
-                flag = _s.unpack_from('<I', raw, 0x4C)[0]
-                w    = _s.unpack_from('<I', raw, 0x44)[0]
-                h    = _s.unpack_from('<I', raw, 0x48)[0]
-                tt   = _s.unpack_from('<I', raw, 0x40)[0]
-                if flag in (0, 1):
-                    rs = _s.unpack_from('<I', raw, 0x58)[0]
-                    pix_off = 0x5C
-                else:
-                    rs = flag
-                    pix_off = 0x50
-                bpp = rs / (w * h) if w * h else 0
-                pix_end = pix_off + rs
-                extra = len(raw) - pix_end
-                lines += [f'texType: {tt}', f'w: {w}', f'h: {h}', f'flag: {flag:#x}',
-                          f'raw_size: {rs}', f'bpp: {bpp:.3f}', f'pix_off: {pix_off:#x}',
-                          f'pix_end: {pix_end}', f'extra_after_pixels: {extra} bytes',
-                          f'has_ci8_tlut (>=512): {extra >= 512}',
-                          f'has_ci4_tlut (>=32):  {extra >= 32}', '']
-            lines += [f'first 96 bytes:']
-            for off in range(0, min(96, len(raw)), 16):
-                lines.append(f'  {off:02x}: {raw[off:off+16].hex(" ")}')
-            self._html('<pre>' + '\n'.join(lines) + '</pre>')
-        elif route == '/debug-paths':
-            # Scan every archive and return all internal paths, grouped by archive.
-            # Visit http://localhost:8765/debug-paths?q=mamenoki to filter.
-            qs    = parse_qs(urlparse(self.path).query)
-            query = unquote(qs.get('q', [''])[0]).lower()
-            result = {}
-            for p in sorted(self.mods_dir.iterdir()):
-                if p.suffix.lower() not in ('.otr', '.o2r'):
-                    continue
-                names = sorted(archive_names(p))
-                if query:
-                    names = [n for n in names if query in n.lower()]
-                result[p.name] = names
-            self._json(json.dumps(result, indent=2))
-        elif route == '/pack-master-log':
-            qs     = parse_qs(urlparse(self.path).query)
-            offset = int(qs.get('offset', ['0'])[0])
-            self._json(json.dumps({
-                'lines': _pack_state['lines'][offset:],
-                'done':  _pack_state['done'],
-                'error': _pack_state['error'],
-            }))
-        elif route == '/rescan-status':
-            self._json(json.dumps({
-                'running': _rescan_state['running'],
-                'done':    _rescan_state['done'],
-                'error':   _rescan_state['error'],
-            }))
-        elif route == '/settings':
-            games_out = {}
-            for gk, gdef in GAME_DEFS.items():
-                defs = _GAME_DEFAULTS.get(gk, {})
-                gcfg = _games_config.get(gk, {})
-                if gk == active_game:
-                    mods_dir_str, base_game_str, master_dir_str = (
-                        str(MODS_DIR)       if MODS_DIR       else '',
-                        str(BASE_GAME_FILE) if BASE_GAME_FILE else '',
-                        str(MASTER_DIR)     if MASTER_DIR     else '',
-                    )
-                else:
-                    mods_dir_str   = gcfg.get('mods_dir',   defs.get('mods_dir', ''))
-                    base_game_str  = gcfg.get('base_game_file', defs.get('base_game_file', ''))
-                    master_dir_str = gcfg.get('master_dir', defs.get('master_dir', ''))
-                games_out[gk] = {
-                    'name':            gdef['name'],
-                    'image':           gdef['image'],
-                    'mods_dir':        mods_dir_str,
-                    'base_game_file':  base_game_str,
-                    'master_dir':      master_dir_str,
-                }
-            self._json(json.dumps({'active_game': active_game, 'games': games_out}))
-        elif route.startswith('/game-img/'):
-            img_name = Path(route.split('/')[-1]).name  # prevent path traversal
-            img_path = SCRIPT_DIR / img_name
-            if img_path.suffix.lower() == '.png' and img_path.exists():
-                self.send_response(200)
-                self.send_header('Content-Type', 'image/png')
-                self.end_headers()
-                self.wfile.write(img_path.read_bytes())
-            else:
-                self.send_response(404); self.end_headers()
-        else:
-            self.send_response(404); self.end_headers()
-
-    def do_POST(self):
-        if self.path == '/preview-geo-build':
-            length = int(self.headers.get('Content-Length', 0))
-            body   = json.loads(self.rfile.read(length))
-            obj_key  = body.get('obj_key', '')
-            geo_stem = body.get('geo_stem', '')
+                mods_dir_str   = gcfg.get('mods_dir',   defs.get('mods_dir', ''))
+                base_game_str  = gcfg.get('base_game_file', defs.get('base_game_file', ''))
+                master_dir_str = gcfg.get('master_dir', defs.get('master_dir', ''))
+            games_out[gk] = {
+                'name':            gdef['name'],
+                'image':           gdef['image'],
+                'image_data_uri':  _icon_data_uri(gdef['image']),
+                'mods_dir':        mods_dir_str,
+                'base_game_file':  base_game_str,
+                'master_dir':      master_dir_str,
+            }
+        return {'active_game': active_game, 'games': games_out}
+    def preview_geo_build(self, obj_key='', geo_stem=''):
             try:
                 with FileLock(CHOICES_LOCK_FILE, timeout=15):
                     original = json.loads(CHOICES_FILE.read_text()) if CHOICES_FILE.exists() else {}
                 preview = dict(original)
-                apply_geo_build(obj_key, geo_stem, self.all_archives,
-                                self.archive_names_cache, self.image_paths_cache, preview)
+                apply_geo_build(obj_key, geo_stem, self._all_archives,
+                                self._archive_names_cache, self._image_paths_cache, preview)
                 changes = {}
                 for k in set(original) | set(preview):
                     if original.get(k) != preview.get(k):
                         changes[k] = preview.get(k)  # None = deleted
                 # Effective winner for every image path under obj_key
-                sorted_arches = sorted(self.all_archives, key=lambda a: a.stem)
+                sorted_arches = sorted(self._all_archives, key=lambda a: a.stem)
                 all_img_paths = set()
-                for arch, imgs in self.image_paths_cache.items():
+                for arch, imgs in self._image_paths_cache.items():
                     all_img_paths.update(p for p in imgs if p.startswith(obj_key))
                 effective = {}
                 for p in all_img_paths:
@@ -1997,26 +1923,21 @@ function _pollPack() {{
                     else:
                         effective[p] = _res_winner(
                             p, sorted_arches,
-                            self.image_paths_cache, self.image_dims_cache
+                            self._image_paths_cache, self._image_dims_cache
                         )
-                self._json(json.dumps({'ok': True, 'changes': changes, 'effective': effective}))
+                return {'ok': True, 'changes': changes, 'effective': effective}
             except Exception as e:
-                self._json(json.dumps({'ok': False, 'error': str(e)}))
-            return
+                return {'ok': False, 'error': str(e)}
 
-        elif self.path == '/set-geo-build':
-            length = int(self.headers.get('Content-Length', 0))
-            body   = json.loads(self.rfile.read(length))
-            obj_key  = body.get('obj_key', '')
-            geo_stem = body.get('geo_stem', '')
+    def set_geo_build(self, obj_key='', geo_stem='', ptype=''):
             try:
                 with FileLock(CHOICES_LOCK_FILE, timeout=15):
                     existing = json.loads(CHOICES_FILE.read_text()) if CHOICES_FILE.exists() else {}
                     changed = apply_geo_build(
                         obj_key, geo_stem,
-                        self.all_archives,
-                        self.archive_names_cache,
-                        self.image_paths_cache,
+                        self._all_archives,
+                        self._archive_names_cache,
+                        self._image_paths_cache,
                         existing,
                     )
                     merged_text = json.dumps(existing, indent=2)
@@ -2030,18 +1951,13 @@ function _pollPack() {{
                     tmp.write_text(merged_text, encoding='utf-8')
                     tmp.replace(CHOICES_FILE)
                 print(f'\n✓ Geo build: {obj_key!r} → {geo_stem!r} ({changed} paths changed)')
-                self._json(json.dumps({'ok': True, 'changed': changed}))
+                return {'ok': True, 'changed': changed}
             except Exception as e:
-                self.send_response(500)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({'ok': False, 'error': str(e)}).encode())
+                return {'ok': False, 'error': str(e)}
 
-        elif self.path == '/submit-browse-choices':
-            length = int(self.headers.get('Content-Length', 0))
-            body   = self.rfile.read(length)
+    def submit_browse_choices(self, new_choices=None):
             try:
-                new_choices = json.loads(body)
+                new_choices = new_choices or {}
                 with FileLock(CHOICES_LOCK_FILE, timeout=15):
                     # Merge into existing choices.json (new selections overwrite conflicting keys)
                     existing = json.loads(CHOICES_FILE.read_text()) if CHOICES_FILE.exists() else {}
@@ -2052,9 +1968,9 @@ function _pollPack() {{
                     # so each object is consistently all-Djipi or all-non-Djipi.
                     geo_added, geo_cleared = enforce_geometry_rules(
                         existing,
-                        self.all_archives,
-                        self.archive_names_cache,
-                        self.image_paths_cache,
+                        self._all_archives,
+                        self._archive_names_cache,
+                        self._image_paths_cache,
                     )
                     merged_text = json.dumps(existing, indent=2)
                     # Validate before touching the real file.
@@ -2077,27 +1993,22 @@ function _pollPack() {{
                 if geo_added or geo_cleared:
                     print(f"  Geometry rules: +{geo_added} auto-excludes, {geo_cleared} dead choices cleared")
                 print(f"\n✓ Browse-select: merged {len(new_choices)} choice(s) → {len(existing)} total in {CHOICES_FILE.name}")
-                self._json(json.dumps({
+                return {
                     "ok": True,
                     "count": len(new_choices),
                     "geo_excluded": geo_added,
                     "geo_cleared": geo_cleared,
-                }))
+                }
             except Exception as e:
-                self.send_response(500)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"ok": False, "error": str(e)}).encode())
-        elif self.path == '/settings':
+                return {"ok": False, "error": str(e)}
+
+    def save_settings(self, mods_dir='', base_game_file='', master_dir=''):
             global MODS_DIR, BASE_GAME_FILE, MASTER_DIR, active_game
-            length = int(self.headers.get('Content-Length', 0))
-            body   = json.loads(self.rfile.read(length))
-            new_mods   = body.get('mods_dir',       '').strip()
-            new_base   = body.get('base_game_file',  '').strip()
-            new_master = body.get('master_dir',      '').strip()
+            new_mods   = (mods_dir or '').strip()
+            new_base   = (base_game_file or '').strip()
+            new_master = (master_dir or '').strip()
             if not new_mods or not new_master:
-                self._json(json.dumps({'ok': False, 'error': 'Mods dir and output destination are required'}))
-                return
+                return {'ok': False, 'error': 'Mods dir and output destination are required'}
             _games_config[active_game] = {'mods_dir': new_mods, 'base_game_file': new_base, 'master_dir': new_master}
             _save_config()
             MODS_DIR       = Path(new_mods)
@@ -2105,15 +2016,13 @@ function _pollPack() {{
             MASTER_DIR     = Path(new_master)
             with _rescan_lock:
                 if not _rescan_state['running']:
-                    threading.Thread(target=_do_scan, daemon=True).start()
-            self._json(json.dumps({'ok': True}))
-        elif self.path == '/switch-game':
-            length = int(self.headers.get('Content-Length', 0))
-            body   = json.loads(self.rfile.read(length))
-            game   = body.get('game', '')
+                    threading.Thread(target=_do_scan, args=(self,), daemon=True).start()
+            return {'ok': True}
+
+    def switch_game(self, game=''):
+            global MODS_DIR, BASE_GAME_FILE, MASTER_DIR, active_game
             if game not in GAME_DEFS:
-                self._json(json.dumps({'ok': False, 'error': f'Unknown game: {game}'}))
-                return
+                return {'ok': False, 'error': f'Unknown game: {game}'}
             active_game = game
             defs = _GAME_DEFAULTS.get(game, {})
             gcfg = _games_config.get(game, {})
@@ -2126,45 +2035,21 @@ function _pollPack() {{
             _save_config()
             with _rescan_lock:
                 if not _rescan_state['running']:
-                    threading.Thread(target=_do_scan, daemon=True).start()
-            self._json(json.dumps({
+                    threading.Thread(target=_do_scan, args=(self,), daemon=True).start()
+            return {
                 'ok': True,
                 'mods_dir':       str(MODS_DIR)       if MODS_DIR       else '',
                 'base_game_file': str(BASE_GAME_FILE) if BASE_GAME_FILE else '',
                 'master_dir':     str(MASTER_DIR)     if MASTER_DIR     else '',
-            }))
-        elif self.path == '/pack-master':
+            }
+
+    def start_pack_master(self):
             with _pack_lock:
                 if _pack_state['running']:
-                    self._json(json.dumps({'ok': False, 'error': 'Already running'}))
-                    return
+                    return {'ok': False, 'error': 'Already running'}
                 _pack_state.update({'running': True, 'lines': [], 'done': False, 'error': None})
-            threading.Thread(target=_pack_worker, daemon=True).start()
-            self._json(json.dumps({'ok': True}))
-        else:
-            self.send_response(404); self.end_headers()
-
-    def _html(self, content):
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
-        self.end_headers()
-        self.wfile.write(content.encode())
-
-    def _json(self, payload):
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.end_headers()
-        self.wfile.write(payload.encode())
-
-    def _img(self, data):
-        if data:
-            self.send_response(200)
-            self.send_header('Content-Type', 'image/png')
-            self.end_headers()
-            self.wfile.write(data)
-        else:
-            self.send_response(404)
-            self.end_headers()
+            threading.Thread(target=_pack_worker, args=(self,), daemon=True).start()
+            return {'ok': True}
 
 _LOADING_HTML = """<!DOCTYPE html>
 <html><head><style>
@@ -2184,41 +2069,23 @@ _LOADING_HTML = """<!DOCTYPE html>
 </div></body></html>"""
 
 
-def _run_server(window=None):
-    print(f"Graphical Texture Picker  —  mods: {MODS_DIR}  port: {PORT}")
-    _do_scan()
-
-    server = ThreadedTCPServer(('', PORT), Handler)
-    server.allow_reuse_address = True
-    print(f"\nListening on http://localhost:{PORT}")
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-
-    if window is not None:
-        # pywebview path: navigate the native window to the app; the webview
-        # event loop in the main thread keeps the process alive until the
-        # window is closed, at which point all daemon threads die cleanly.
-        window.load_url(f'http://localhost:{PORT}/master-browse')
-    else:
-        webbrowser.open(f'http://localhost:{PORT}')
-        print("  Press Ctrl+C to stop.")
-        try:
-            t.join()
-        except KeyboardInterrupt:
-            print("\nShutting down.")
-            server.shutdown()
+def _startup(api):
+    print(f"Graphical Texture Picker  —  mods: {MODS_DIR}")
+    _do_scan(api)
+    api.go_master_browse()
 
 
 def main():
-    try:
-        import webview
-        window = webview.create_window(
-            'Graphical Texture Picker', html=_LOADING_HTML,
-            width=1440, height=900, min_size=(800, 600),
-        )
-        webview.start(_run_server, window, gui='edgechromium')
-    except ImportError:
-        _run_server()
+    api = Api()
+    window = webview.create_window(
+        'Graphical Texture Picker', html=_LOADING_HTML,
+        width=1440, height=900, min_size=(800, 600),
+        js_api=api,
+    )
+    api._window = window
+    # debug=False (the default) keeps WebView2 devtools off — never flip this
+    # in a packaged build, it opens a real TCP devtools port.
+    webview.start(_startup, api, gui='edgechromium')
 
 
 if __name__ == '__main__':
