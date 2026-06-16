@@ -11,14 +11,18 @@ Usage in any script:
 The lock is released automatically when the `with` block exits.
 Never read/write choices.json directly — always go through this module.
 """
+import sys
 import json
 from contextlib import contextmanager
 from pathlib import Path
 from filelock import FileLock
 
 SCRIPT_DIR        = Path(__file__).parent
-CHOICES_FILE      = SCRIPT_DIR / "choices.json"
-CHOICES_LOCK_FILE = SCRIPT_DIR / "choices.json.lock"
+# Match otr_picker_server.py's APP_DIR: in a packaged --onedir build,
+# __file__ resolves inside _internal/, not next to the .exe.
+APP_DIR           = Path(sys.executable).parent if getattr(sys, 'frozen', False) else SCRIPT_DIR
+CHOICES_FILE      = APP_DIR / "choices.json"
+CHOICES_LOCK_FILE = APP_DIR / "choices.json.lock"
 
 
 def _write(data: dict) -> None:

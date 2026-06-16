@@ -42,12 +42,17 @@ def read_image_dims(data):
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SCRIPT_DIR   = Path(__file__).parent
-CHOICES_FILE = SCRIPT_DIR / "choices.json"
-OUTPUT_DIR   = SCRIPT_DIR / "master_output"
+# In a packaged --onedir build, __file__ resolves inside _internal/, not next
+# to the .exe — but choices.json/config.json/master_output need to be where
+# otr_picker_server.py's APP_DIR puts them (next to the .exe), since this
+# module gets imported and run from inside that same frozen process.
+APP_DIR      = Path(sys.executable).parent if getattr(sys, 'frozen', False) else SCRIPT_DIR
+CHOICES_FILE = APP_DIR / "choices.json"
+OUTPUT_DIR   = APP_DIR / "master_output"
 OUTPUT_FILE  = OUTPUT_DIR / "999_Master.o2r"
 
 def _load_cfg():
-    cfg_path = SCRIPT_DIR / "config.json"
+    cfg_path = APP_DIR / "config.json"
     if cfg_path.exists():
         try:
             c = json.loads(cfg_path.read_text(encoding='utf-8'))

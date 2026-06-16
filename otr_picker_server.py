@@ -29,6 +29,23 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+# Windows tags every file extracted from a downloaded .zip with a hidden
+# "Zone.Identifier" NTFS stream (Mark of the Web). The legacy .NET Framework
+# loader pythonnet/clr_loader uses refuses to fully trust a flagged DLL,
+# which breaks pywebview's winforms/edgechromium backend with a cryptic
+# "Failed to resolve Python.Runtime.Loader.Initialize" error — every single
+# person who downloads the packaged .exe from a GitHub release hits this.
+# Strip the flag from our own bundled files before pythonnet ever loads.
+if sys.platform == 'win32':
+    _app_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) \
+        else os.path.dirname(os.path.abspath(__file__))
+    for _dirpath, _dirnames, _filenames in os.walk(_app_dir):
+        for _fn in _filenames:
+            try:
+                os.remove(os.path.join(_dirpath, _fn) + ':Zone.Identifier')
+            except OSError:
+                pass
+
 try:
     import webview
 except ImportError:
@@ -56,9 +73,15 @@ threading.excepthook = _filtered_threading_excepthook
 
 # ── config ─────────────────────────────────────────────────────────────────────
 SCRIPT_DIR        = Path(__file__).parent
-CHOICES_FILE      = SCRIPT_DIR / "choices.json"
-CHOICES_LOCK_FILE = SCRIPT_DIR / "choices.json.lock"
-CONFIG_FILE       = SCRIPT_DIR / "config.json"
+# In a packaged --onedir build, __file__ resolves inside _internal/ (the
+# bundled resources folder), not next to the .exe. That's correct for
+# read-only bundled assets (e.g. soh.png) but wrong for user data, which
+# should live next to the .exe — discoverable, and not wiped out if a
+# future update replaces _internal/ wholesale.
+APP_DIR           = Path(sys.executable).parent if getattr(sys, 'frozen', False) else SCRIPT_DIR
+CHOICES_FILE      = APP_DIR / "choices.json"
+CHOICES_LOCK_FILE = APP_DIR / "choices.json.lock"
+CONFIG_FILE       = APP_DIR / "config.json"
 
 # ── Game definitions ───────────────────────────────────────────────────────────
 # Add future games here; each entry needs a display name and logo filename.
