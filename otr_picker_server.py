@@ -250,10 +250,14 @@ def _do_scan(api):
     finally:
         _rescan_state['running'] = False
 
-# ── Djipi 3DS geometry/texture pack pairs ─────────────────────────────────────
+# ── Geometry/texture pack pairs ────────────────────────────────────────────────
 # Maps geometry pack stem → paired texture pack stem.
 # Geometry pack display lists reference mat_* paths that ONLY exist in the
 # paired texture pack.  If the pair is missing, geometry renders borked.
+# Originally just Djipi's 3DS replacements, but the same constraint applies
+# to any model+texture pack pair (e.g. the standalone Young Link Model /
+# Young Link Textures pack) — they all get a "Geometry Build" selector and
+# the same auto-exclude protection below, regardless of who made the pack.
 DJIPI_PAIRS = {
     "Djipi's 3DE - 03 Objects Animals":           "Djipi's 3DE - 04 Objects Animals Textures (3DS)",
     "Djipi's 3DE - 05 Objects Inventory":          "Djipi's 3DE - 06 Objects Inventory Textures (3DS)",
@@ -264,6 +268,7 @@ DJIPI_PAIRS = {
     "Djipi's 3DE - 18 Objects ARIA 3DS(OPTIONAL)": "Djipi's 3DE - 19 Objects ARIA 3DS Textures (OPTIONAL)",
     "Djipi's 3DE - 24 Majora Chest (OPTIONAL)":    "Djipi's 3DE - 25 Majora Chest 3DS Textures (OPTIONAL)",
     "Djipi's 3DE - 26 Background 3DS":             "Djipi's 3DE - 27 Background Textures",
+    "Young Link Model":                            "Young Link Textures",
 }
 
 def enforce_geometry_rules(choices, all_archives, archive_names_cache, image_paths_cache):
