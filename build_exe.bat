@@ -10,6 +10,7 @@ pyinstaller ^
   --onedir ^
   --hidden-import webview.platforms.winforms ^
   --hidden-import clr ^
+  --add-data "soh.png;." ^
   otr_picker_server.py
 
 echo.

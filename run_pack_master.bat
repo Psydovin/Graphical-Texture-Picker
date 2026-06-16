@@ -19,25 +19,25 @@ if errorlevel 1 (
     python -m pip install mpyq --quiet
 )
 
-:: Check if the picker server is running on port 8765
-netstat -ano | findstr ":8765" | findstr "LISTENING" >nul 2>&1
-if not errorlevel 1 (
-    echo WARNING: Graphical Texture Picker Server is running on port 8765.
-    echo The output file will be locked and the build will fail.
-    echo.
-    echo Please close the server ^(Ctrl+C in its window^), then press any key to continue.
-    pause >nul
-    echo.
-    :: Confirm it's closed
-    netstat -ano | findstr ":8765" | findstr "LISTENING" >nul 2>&1
-    if not errorlevel 1 (
-        echo Server is still running. Exiting.
-        pause
-        exit /b 1
-    )
-    echo Server closed. Continuing...
-    echo.
+:: Check if the picker app (dev script or packaged exe) is already running —
+:: it has the master archive open for reading, which can lock the file.
+call :CheckPickerRunning
+if "%PICKER_RUNNING%"=="0" goto :picker_not_running
+echo WARNING: Graphical Texture Picker appears to be running.
+echo The output file may be locked and the build will fail.
+echo.
+echo Please close it, then press any key to continue.
+pause >nul
+echo.
+call :CheckPickerRunning
+if not "%PICKER_RUNNING%"=="0" (
+    echo Still running. Exiting.
+    pause
+    exit /b 1
 )
+echo Closed. Continuing...
+echo.
+:picker_not_running
 
 :: Run the packer
 echo Running otr_pack_master.py...
@@ -82,3 +82,9 @@ if exist "%SRC_NEW%" (
 echo.
 echo Done! 999_Master.o2r is in your mods folder.
 pause
+exit /b 0
+
+:CheckPickerRunning
+set PICKER_RUNNING=0
+for /f "delims=" %%i in ('powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*otr_picker_server.py*' } | Measure-Object).Count + (Get-Process 'Graphical Texture Picker' -ErrorAction SilentlyContinue | Measure-Object).Count"') do set PICKER_RUNNING=%%i
+exit /b 0
