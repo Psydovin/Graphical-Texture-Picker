@@ -764,9 +764,18 @@ class Api:
         return {'ok': True, 'data': data} if data else {'ok': False}
 
     # ── navigation: render full HTML and swap the document directly ────────────
-    def go_master_browse(self, obj='', ptype='objects', q='', page=1):
+    def save_scroll(self, y=0):
         try:
-            html_out = self.render_master_browse(obj, ptype, q, page)
+            self._scroll_restore = max(0, int(y or 0))
+        except (TypeError, ValueError):
+            self._scroll_restore = 0
+        return {'ok': True}
+
+    def go_master_browse(self, obj='', ptype='objects', q='', page=1):
+        scroll_y = getattr(self, '_scroll_restore', 0)
+        self._scroll_restore = 0
+        try:
+            html_out = self.render_master_browse(obj, ptype, q, page, scroll_y=scroll_y)
         except Exception as e:
             import traceback
             html_out = f'<pre>render_master_browse error: {e}\n{traceback.format_exc()}</pre>'
@@ -793,7 +802,7 @@ class Api:
         threading.Timer(0.05, self._window.load_html, args=(html_out,)).start()
         return {'ok': True}
 
-    def render_master_browse(self, obj='', ptype='objects', q='', page=1):
+    def render_master_browse(self, obj='', ptype='objects', q='', page=1, scroll_y=0):
             # Browse 999_Master.o2r with side-by-side comparison against source packs.
             selected = obj or ''
             ptype    = ptype or 'objects'
@@ -1278,10 +1287,11 @@ function filterSidebar(val) {{
 
 // Navigation: every "page change" re-renders server-side and swaps the
 // whole document via window.load_html() — there is no HTTP server/URL bar.
-let SELECTED = {json.dumps(selected)};
-let PTYPE    = {json.dumps(ptype)};
-let SEARCH_Q = {json.dumps(q)};
-let PAGE     = {page};
+let SELECTED       = {json.dumps(selected)};
+let PTYPE          = {json.dumps(ptype)};
+let SEARCH_Q       = {json.dumps(q)};
+let PAGE           = {page};
+let SCROLL_RESTORE = {scroll_y};
 
 function goObj(obj) {{
   pywebview.api.go_master_browse(obj, PTYPE, '', 1);
@@ -1302,7 +1312,8 @@ function clearSearch() {{
 function goSearchObj(cat, obj) {{
   pywebview.api.go_master_browse(obj, cat, SEARCH_Q, 1);
 }}
-function reloadCurrentView() {{
+async function reloadCurrentView() {{
+  await pywebview.api.save_scroll(window.scrollY);
   pywebview.api.go_master_browse(SELECTED, PTYPE, SEARCH_Q, PAGE);
 }}
 
@@ -1384,6 +1395,12 @@ document.querySelectorAll('.geo-btn').forEach(function(b) {{
   if (window.pywebview && window.pywebview.api) startObserving();
   else window.addEventListener('pywebviewready', startObserving);
 }})();
+
+if (SCROLL_RESTORE > 0) {{
+  function _doScrollRestore() {{ window.scrollTo(0, SCROLL_RESTORE); }}
+  if (window.pywebview && window.pywebview.api) setTimeout(_doScrollRestore, 150);
+  else window.addEventListener('pywebviewready', function() {{ setTimeout(_doScrollRestore, 150); }});
+}}
 
 let sels = {{}};
 let pendingGeoBuild = null;  // {{stem, totalChanges}} while previewing a geo build
