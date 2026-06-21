@@ -1308,7 +1308,9 @@ async function goObj(obj) {{
 function goType(t) {{
   pywebview.api.go_master_browse('', t, '', 1);
 }}
-function goPage(n) {{
+async function goPage(n) {{
+  var sb = document.querySelector('.sidebar');
+  await pywebview.api.save_scroll(0, sb ? sb.scrollTop : 0);
   pywebview.api.go_master_browse(SELECTED, PTYPE, SEARCH_Q, n);
 }}
 function doSearch() {{
