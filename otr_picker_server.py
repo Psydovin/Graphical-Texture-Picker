@@ -2238,7 +2238,7 @@ def main():
     window = webview.create_window(
         'Graphical Texture Picker', html=_LOADING_HTML,
         width=1440, height=900, min_size=(800, 600),
-        js_api=api,
+        js_api=api, text_select=True,
     )
     api._window = window
     # debug=False (the default) keeps WebView2 devtools off — never flip this
