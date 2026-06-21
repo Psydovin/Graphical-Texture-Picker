@@ -764,6 +764,17 @@ class Api:
         return {'ok': True, 'data': data} if data else {'ok': False}
 
     # ── navigation: render full HTML and swap the document directly ────────────
+    def copy_to_clipboard(self, text=''):
+        try:
+            import subprocess
+            subprocess.run(
+                ['powershell', '-noprofile', '-command', 'Set-Clipboard -Value $input'],
+                input=str(text), text=True, capture_output=True
+            )
+            return {'ok': True}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
     def save_scroll(self, y=0, sidebar_y=0):
         try:
             self._scroll_restore = max(0, int(y or 0))
@@ -1284,21 +1295,12 @@ function checkRowImages(img) {{
     row.style.display = 'none';
 }}
 
-// Copy path to clipboard on click
+// Copy path to clipboard on click (routed through Python bridge — WebView2
+// doesn't grant clipboard access to load_html() virtual origins)
 function copyPath(el, path) {{
   var prev = el.textContent;
   var prevColor = el.style.color;
-  navigator.clipboard.writeText(path).then(function() {{
-    el.textContent = '✓ copied';
-    el.style.color = '#4caf50';
-    setTimeout(function() {{ el.textContent = prev; el.style.color = prevColor; }}, 1200);
-  }}).catch(function() {{
-    var ta = document.createElement('textarea');
-    ta.value = path;
-    ta.style.position = 'fixed'; ta.style.opacity = '0';
-    document.body.appendChild(ta); ta.select();
-    document.execCommand('copy');
-    document.body.removeChild(ta);
+  pywebview.api.copy_to_clipboard(path).then(function() {{
     el.textContent = '✓ copied';
     el.style.color = '#4caf50';
     setTimeout(function() {{ el.textContent = prev; el.style.color = prevColor; }}, 1200);
