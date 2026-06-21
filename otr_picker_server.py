@@ -1016,7 +1016,8 @@ class Api:
                     )
                     rows.append(
                         f'<tr data-img-count="{img_count}" data-img-failed="0" data-path="{p}" data-committed-winner="{committed_winners[p]}">'
-                        f'<td style="font-size:10px;font-family:monospace;max-width:180px;word-break:break-all;color:#666;vertical-align:top;padding:4px">{fname}</td>'
+                        f'<td onclick="copyPath(this,{json.dumps(p)})" title="Click to copy full path" '
+                        f'style="font-size:10px;font-family:monospace;max-width:180px;word-break:break-all;color:#666;vertical-align:top;padding:4px;cursor:pointer">{fname}</td>'
                         f'{master_td}{"".join(pack_tds)}{exclude_td}'
                         f'</tr>'
                     )
@@ -1281,6 +1282,27 @@ function checkRowImages(img) {{
   row.setAttribute('data-img-failed', failed);
   if (failed >= (+row.getAttribute('data-img-count') || 1))
     row.style.display = 'none';
+}}
+
+// Copy path to clipboard on click
+function copyPath(el, path) {{
+  var prev = el.textContent;
+  var prevColor = el.style.color;
+  navigator.clipboard.writeText(path).then(function() {{
+    el.textContent = '✓ copied';
+    el.style.color = '#4caf50';
+    setTimeout(function() {{ el.textContent = prev; el.style.color = prevColor; }}, 1200);
+  }}).catch(function() {{
+    var ta = document.createElement('textarea');
+    ta.value = path;
+    ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    el.textContent = '✓ copied';
+    el.style.color = '#4caf50';
+    setTimeout(function() {{ el.textContent = prev; el.style.color = prevColor; }}, 1200);
+  }});
 }}
 
 // Sidebar filter
